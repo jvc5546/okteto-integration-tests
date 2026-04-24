@@ -1,3 +1,5 @@
+# integration-tests/Dockerfile
+#
 # Image that bundles all tools needed to run both Okteto integration test
 # scripts: the platform health checks (run.sh) and the Okteto CLI end-to-end
 # tests (okteto-e2e.sh).
@@ -48,8 +50,11 @@ RUN curl -fsSL \
     && kubectl version --client
 
 # Install Okteto CLI
-RUN curl -fsSL \
-      "https://github.com/okteto/okteto/releases/download/${OKTETO_CLI_VERSION}/okteto-Linux-${TARGETARCH}" \
+# Okteto releases use "x86_64" for amd64 and "arm64" for arm64, so we map
+# Docker's TARGETARCH value to the naming convention used in the release URLs.
+RUN OKTETO_ARCH=$([ "$TARGETARCH" = "amd64" ] && echo "x86_64" || echo "$TARGETARCH") \
+    && curl -fsSL \
+      "https://github.com/okteto/okteto/releases/download/${OKTETO_CLI_VERSION}/okteto-Linux-${OKTETO_ARCH}" \
       -o /usr/local/bin/okteto \
     && chmod +x /usr/local/bin/okteto \
     && okteto version
@@ -61,9 +66,9 @@ RUN curl -fsSL \
     && chmod +x /usr/local/bin/grpc_health_probe \
     || echo "WARNING: grpc_health_probe not installed; TCP fallback will be used"
 
-COPY run-integration-tests.sh        /usr/local/bin/run-integration-tests.sh
-COPY run-okteto-e2e.sh                   /usr/local/bin/run-okteto-e2e.sh
-COPY entrypoint.sh                   /usr/local/bin/entrypoint.sh
+COPY run-integration-tests.sh   /usr/local/bin/run-integration-tests.sh
+COPY run-okteto-e2e.sh           /usr/local/bin/run-okteto-e2e.sh
+COPY entrypoint.sh               /usr/local/bin/entrypoint.sh
 
 RUN chmod +x \
       /usr/local/bin/run-integration-tests.sh \
