@@ -1,13 +1,12 @@
 #!/usr/bin/env sh
-# integration-tests/okteto-e2e.sh
+# integration-tests/run-okteto-e2e.sh
 #
 # Okteto end-to-end integration tests using the oktetodo sample app.
 # https://github.com/okteto/oktetodo
 #
-# Runs after run.sh has confirmed the platform is healthy. Exercises the
-# full Okteto deployment lifecycle — build, deploy, sleep, wake, redeploy,
-# destroy, and preview environments — using a real multi-service application
-# so that any regression in the platform is caught immediately.
+# Runs after run-integration-tests.sh has confirmed the platform is healthy.
+# Exercises the full Okteto deployment lifecycle — build, deploy, sleep, wake,
+# redeploy, destroy, and preview environments.
 #
 # Exit codes
 #   0 – all tests passed
@@ -15,25 +14,19 @@
 #
 # Required environment variables (injected by the Helm Job template):
 #   OKTETO_URL        – Public URL of the Okteto instance
-#                       e.g. "https://okteto.dev.example.com"
-#   OKTETO_TOKEN      – Service account token. Authentication-method agnostic:
-#                       the token is issued by the Okteto platform itself
-#                       regardless of the cluster's IdP (GitHub, OIDC, etc.)
-#                       Create one at: <okteto-url>/settings → API Tokens
+#   OKTETO_TOKEN      – Service account token (from Kubernetes secret)
 #   OKTETO_NAMESPACE  – Namespace where Okteto itself is installed
 #   OKTETO_SUBDOMAIN  – Wildcard subdomain
 #
 # Optional environment variables:
-#   E2E_TEST_NAMESPACE  – Override the test namespace name
-#                         (default: okteto-e2e-<pid>)
-#   E2E_PREVIEW_NAME    – Override the preview environment name
-#                         (default: e2e-preview-<pid>)
+#   E2E_TEST_NAMESPACE  – Override the test namespace (default: okteto-e2e-<pid>)
+#   E2E_PREVIEW_NAME    – Override the preview name (default: e2e-preview-<pid>)
 #   E2E_SKIP_PREVIEW    – Set to "true" to skip preview environment tests
 
 set -eu
 
 DEMO_REPO="https://github.com/okteto/oktetodo"
-DEMO_APP_NAME="oktetodo"
+DEMO_DIR="/tmp/oktetodo"
 
 # ── colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -91,8 +84,6 @@ section_summary() {
 }
 
 # time_step <description> <command...>
-# Runs a command, records elapsed time, reports pass/fail with duration,
-# and prints captured output on failure.
 time_step() {
   description="$1"
   shift
@@ -109,8 +100,6 @@ time_step() {
 }
 
 # ── cleanup trap ──────────────────────────────────────────────────────────────
-# Fires on exit, interrupt, or termination. Ensures test namespaces and
-# preview environments are always destroyed, even if the script crashes.
 
 TEST_NAMESPACE="${E2E_TEST_NAMESPACE:-okteto-e2e-$$}"
 PREVIEW_NAME="${E2E_PREVIEW_NAME:-e2e-preview-$$}"
@@ -121,18 +110,15 @@ cleanup() {
   CLEANUP_DONE=1
   printf "\n${YELLOW}  Running cleanup...${NC}\n"
 
-  # Switch away from the test namespace before deleting it
-  okteto namespace use default 2>/dev/null \
-    || okteto namespace use "$OKTETO_NAMESPACE" 2>/dev/null \
-    || true
+  okteto namespace use default --insecure-skip-tls-verify 2>/dev/null || true
 
-  if okteto namespace list 2>/dev/null | grep -q "^${TEST_NAMESPACE}"; then
-    okteto namespace delete --name "$TEST_NAMESPACE" --force 2>/dev/null || true
+  if okteto namespace list --insecure-skip-tls-verify 2>/dev/null | grep -q "^${TEST_NAMESPACE}"; then
+    okteto namespace delete "$TEST_NAMESPACE" --insecure-skip-tls-verify 2>/dev/null || true
     printf "  Deleted test namespace: %s\n" "$TEST_NAMESPACE"
   fi
 
-  if okteto preview list 2>/dev/null | grep -q "$PREVIEW_NAME"; then
-    okteto preview destroy "$PREVIEW_NAME" 2>/dev/null || true
+  if okteto preview list --insecure-skip-tls-verify 2>/dev/null | grep -q "$PREVIEW_NAME"; then
+    okteto preview destroy "$PREVIEW_NAME" --insecure-skip-tls-verify 2>/dev/null || true
     printf "  Deleted preview environment: %s\n" "$PREVIEW_NAME"
   fi
 }
@@ -159,140 +145,133 @@ printf "  Preview Name    :  %s\n" "${PREVIEW_NAME}"
 printf "${BOLD}%s${NC}\n\n" "════════════════════════════════════════════════"
 
 # ── 1. Authentication ─────────────────────────────────────────────────────────
-# okteto context use authenticates using a service account token.
-# This is authentication-method agnostic — the token is issued by the Okteto
-# platform regardless of the cluster's configured IdP (GitHub, OIDC, LDAP).
-# Users create tokens at: <okteto-url>/settings → API Tokens.
+# Uses --insecure-skip-tls-verify for self-signed/private CA certificates.
+# The flag is persisted in the context so all subsequent commands inherit it.
 section "1. Authentication"
 printf "  Authenticating with the Okteto platform using a service account token\n\n"
 
 time_step "Set Okteto context" \
-  okteto context use "$OKTETO_URL" --token "$OKTETO_TOKEN"
+  okteto context use "$OKTETO_URL" \
+    --token "$OKTETO_TOKEN" \
+    --insecure-skip-tls-verify
 
 time_step "Verify context is active" \
-  okteto context show
+  okteto context show --insecure-skip-tls-verify
 
 section_summary
 
-# ── 2. Namespace Management ───────────────────────────────────────────────────
-section "2. Namespace Management"
+# ── 2. Clone demo repo ────────────────────────────────────────────────────────
+# Clone oktetodo so we can run okteto commands from inside its directory,
+# since --repository flag is not available in this CLI version.
+section "2. Clone Demo Repository"
+printf "  Cloning %s\n\n" "$DEMO_REPO"
+
+time_step "Clone oktetodo repository" \
+  git clone --depth=1 "$DEMO_REPO" "$DEMO_DIR"
+
+section_summary
+
+# ── 3. Namespace Management ───────────────────────────────────────────────────
+section "3. Namespace Management"
 printf "  Creating a dedicated test namespace for this run\n\n"
 
 time_step "Create test namespace: $TEST_NAMESPACE" \
-  okteto namespace create "$TEST_NAMESPACE"
+  okteto namespace create "$TEST_NAMESPACE" \
+    --insecure-skip-tls-verify
 
 time_step "Switch to test namespace" \
-  okteto namespace use "$TEST_NAMESPACE"
+  okteto namespace use "$TEST_NAMESPACE" \
+    --insecure-skip-tls-verify
 
 time_step "Verify namespace appears in list" \
-  sh -c "okteto namespace list | grep -q '^${TEST_NAMESPACE}'"
+  sh -c "okteto namespace list --insecure-skip-tls-verify | grep -q '^${TEST_NAMESPACE}'"
 
 section_summary
 
-# ── 3. Build ──────────────────────────────────────────────────────────────────
-# okteto deploy --repository clones the repo into a temporary directory,
-# runs the build section of the okteto.yaml, and pushes images to the
-# Okteto Registry — exercising the full BuildKit path.
-section "3. Image Build"
-printf "  Building oktetodo images via the Okteto Build Service (BuildKit)\n"
-printf "  Repository: %s\n\n" "$DEMO_REPO"
+# ── 4. Build ──────────────────────────────────────────────────────────────────
+section "4. Image Build"
+printf "  Building oktetodo images via the Okteto Build Service (BuildKit)\n\n"
 
-time_step "Build all images from $DEMO_REPO" \
+cd "$DEMO_DIR"
+time_step "Build all images" \
   okteto build \
-    --repository "$DEMO_REPO" \
-    --branch main
+    --log-output plain \
+    --insecure-skip-tls-verify
 
 section_summary
 
-# ── 4. Deployment ─────────────────────────────────────────────────────────────
-section "4. Deployment"
-printf "  Deploying oktetodo into the test namespace using its okteto.yaml\n\n"
+# ── 5. Deployment ─────────────────────────────────────────────────────────────
+section "5. Deployment"
+printf "  Deploying oktetodo into the test namespace\n\n"
 
-time_step "Deploy $DEMO_APP_NAME from $DEMO_REPO" \
+time_step "Deploy oktetodo" \
   okteto deploy \
-    --repository "$DEMO_REPO" \
-    --branch main \
-    --wait
+    --wait \
+    --insecure-skip-tls-verify
 
-# Retrieve the client endpoint Okteto exposes after deploy
-CLIENT_ENDPOINT=$(okteto deploy \
-  --repository "$DEMO_REPO" \
-  --branch main \
-  --output json 2>/dev/null \
-  | jq -r '.endpoints[0] // empty' 2>/dev/null || true)
+# Retrieve the client ingress hostname for the reachability check
+CLIENT_HOST=$(kubectl get ingress \
+  -n "$TEST_NAMESPACE" \
+  -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || true)
 
-if [ -n "$CLIENT_ENDPOINT" ]; then
-  time_step "Verify deployed app is reachable at $CLIENT_ENDPOINT" \
+if [ -n "$CLIENT_HOST" ]; then
+  time_step "Verify app is reachable at https://$CLIENT_HOST" \
     sh -c "curl -sk -o /dev/null -w '%{http_code}' \
       --connect-timeout 10 --max-time 20 \
-      '${CLIENT_ENDPOINT}' | grep -qE '^(200|301|302)$'"
+      'https://${CLIENT_HOST}' | grep -qE '^(200|301|302)$'"
 else
-  # Fall back to checking the ingress directly via kubectl
-  CLIENT_HOST=$(kubectl get ingress \
-    -n "$TEST_NAMESPACE" \
-    -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || true)
-  if [ -n "$CLIENT_HOST" ]; then
-    time_step "Verify deployed app is reachable at https://$CLIENT_HOST" \
-      sh -c "curl -sk -o /dev/null -w '%{http_code}' \
-        --connect-timeout 10 --max-time 20 \
-        'https://${CLIENT_HOST}' | grep -qE '^(200|301|302)$'"
-  else
-    skip "Could not resolve app endpoint — skipping reachability check"
-  fi
+  skip "Could not resolve ingress hostname — skipping reachability check"
 fi
 
 section_summary
 
-# ── 5. Sleep & Wake ───────────────────────────────────────────────────────────
-section "5. Sleep and Wake"
+# ── 6. Sleep & Wake ───────────────────────────────────────────────────────────
+section "6. Sleep and Wake"
 printf "  Testing namespace sleep (scale to zero) and wake (scale back up)\n\n"
 
 time_step "Sleep namespace: $TEST_NAMESPACE" \
-  okteto namespace sleep "$TEST_NAMESPACE"
+  okteto namespace sleep "$TEST_NAMESPACE" \
+    --insecure-skip-tls-verify
 
-# After sleep, all deployments in the namespace should have 0 replicas
 time_step "Verify all deployments are scaled to zero" \
-  sh -c "kubectl get deployments -n '${TEST_NAMESPACE}' \
+  sh -c "! kubectl get deployments -n '${TEST_NAMESPACE}' \
     -o jsonpath='{.items[*].spec.replicas}' \
-    | tr ' ' '\n' | grep -v '^$' | grep -qv '^0$' && exit 1 || exit 0"
+    | tr ' ' '\n' | grep -qv '^0$'"
 
 time_step "Wake namespace: $TEST_NAMESPACE" \
-  okteto namespace wake "$TEST_NAMESPACE"
+  okteto namespace wake "$TEST_NAMESPACE" \
+    --insecure-skip-tls-verify
 
 time_step "Wait for all deployments to be ready after wake" \
   kubectl rollout status deployment \
-    -l "app.kubernetes.io/managed-by=okteto" \
     -n "$TEST_NAMESPACE" \
     --timeout=180s
 
 section_summary
 
-# ── 6. Incremental Redeploy ───────────────────────────────────────────────────
-section "6. Incremental Redeploy"
+# ── 7. Incremental Redeploy ───────────────────────────────────────────────────
+section "7. Incremental Redeploy"
 printf "  Running a second deploy — should use Smart Build cache and skip rebuilds\n\n"
 
-time_step "Redeploy $DEMO_APP_NAME (expect cache hit, no rebuild)" \
+time_step "Redeploy oktetodo (expect cache hit, no rebuild)" \
   okteto deploy \
-    --repository "$DEMO_REPO" \
-    --branch main \
-    --wait
+    --wait \
+    --insecure-skip-tls-verify
 
 time_step "Wait for all deployments to be ready after redeploy" \
   kubectl rollout status deployment \
-    -l "app.kubernetes.io/managed-by=okteto" \
     -n "$TEST_NAMESPACE" \
     --timeout=180s
 
 section_summary
 
-# ── 7. Destroy Deployment ─────────────────────────────────────────────────────
-section "7. Destroy Deployment"
+# ── 8. Destroy Deployment ─────────────────────────────────────────────────────
+section "8. Destroy Deployment"
 printf "  Running okteto destroy to remove all deployed resources\n\n"
 
-time_step "Destroy $DEMO_APP_NAME" \
+time_step "Destroy oktetodo" \
   okteto destroy \
-    --repository "$DEMO_REPO" \
-    --branch main
+    --insecure-skip-tls-verify
 
 time_step "Verify all deployments are removed from namespace" \
   sh -c "[ \"\$(kubectl get deployments -n '${TEST_NAMESPACE}' \
@@ -300,27 +279,28 @@ time_step "Verify all deployments are removed from namespace" \
 
 section_summary
 
-# ── 8. Destroy Namespace ──────────────────────────────────────────────────────
-section "8. Destroy Namespace"
+# ── 9. Destroy Namespace ──────────────────────────────────────────────────────
+section "9. Destroy Namespace"
 printf "  Deleting the test namespace and confirming it is fully removed\n\n"
 
 time_step "Switch context away from test namespace" \
-  sh -c "okteto namespace use default 2>/dev/null \
-    || okteto namespace use '${OKTETO_NAMESPACE}' 2>/dev/null"
+  okteto namespace use default \
+    --insecure-skip-tls-verify
 
 time_step "Delete test namespace: $TEST_NAMESPACE" \
-  okteto namespace delete --name "$TEST_NAMESPACE" --force
+  okteto namespace delete "$TEST_NAMESPACE" \
+    --insecure-skip-tls-verify
 
 time_step "Verify namespace is removed" \
-  sh -c "! okteto namespace list 2>/dev/null | grep -q '^${TEST_NAMESPACE}'"
+  sh -c "! okteto namespace list --insecure-skip-tls-verify 2>/dev/null \
+    | grep -q '^${TEST_NAMESPACE}'"
 
-# Mark as done so the trap doesn't double-delete
 CLEANUP_DONE=1
 
 section_summary
 
-# ── 9. Preview Environments ───────────────────────────────────────────────────
-section "9. Preview Environments"
+# ── 10. Preview Environments ──────────────────────────────────────────────────
+section "10. Preview Environments"
 
 if [ "${E2E_SKIP_PREVIEW:-false}" = "true" ]; then
   skip "Preview tests skipped  (E2E_SKIP_PREVIEW=true)"
@@ -329,18 +309,18 @@ else
 
   time_step "Deploy preview environment: $PREVIEW_NAME" \
     okteto preview deploy "$PREVIEW_NAME" \
-      --repository "$DEMO_REPO" \
       --branch main \
       --scope global \
-      --wait
+      --wait \
+      --insecure-skip-tls-verify
 
-  # Retrieve the preview URL
   PREVIEW_URL=$(okteto preview show "$PREVIEW_NAME" \
+    --insecure-skip-tls-verify \
     -o json 2>/dev/null \
     | jq -r '.url // empty' 2>/dev/null || true)
 
   if [ -n "$PREVIEW_URL" ]; then
-    time_step "Verify preview environment is reachable at $PREVIEW_URL" \
+    time_step "Verify preview is reachable at $PREVIEW_URL" \
       sh -c "curl -sk -o /dev/null -w '%{http_code}' \
         --connect-timeout 10 --max-time 20 \
         '${PREVIEW_URL}' | grep -qE '^(200|301|302)$'"
@@ -349,10 +329,12 @@ else
   fi
 
   time_step "Destroy preview environment: $PREVIEW_NAME" \
-    okteto preview destroy "$PREVIEW_NAME"
+    okteto preview destroy "$PREVIEW_NAME" \
+      --insecure-skip-tls-verify
 
   time_step "Verify preview environment is removed" \
-    sh -c "! okteto preview list 2>/dev/null | grep -q '${PREVIEW_NAME}'"
+    sh -c "! okteto preview list --insecure-skip-tls-verify 2>/dev/null \
+      | grep -q '${PREVIEW_NAME}'"
 
   CLEANUP_DONE=1
 fi
