@@ -4,10 +4,6 @@
 # Okteto end-to-end integration tests using the oktetodo sample app.
 # https://github.com/okteto/oktetodo
 #
-# Runs after run-integration-tests.sh has confirmed the platform is healthy.
-# Exercises the full Okteto deployment lifecycle — build, deploy, sleep, wake,
-# redeploy, destroy, and preview environments.
-#
 # Exit codes
 #   0 – all tests passed
 #   1 – one or more tests failed
@@ -27,9 +23,6 @@ set -eu
 
 DEMO_REPO="https://github.com/okteto/oktetodo"
 DEMO_DIR="/tmp/oktetodo"
-
-# Plain okteto — TLS skip is persisted in the context after "context use"
-OKTETO="okteto"
 
 # ── colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -102,10 +95,20 @@ time_step() {
   rm -f /tmp/step_output
 }
 
+# ── validate required env vars ────────────────────────────────────────────────
+
+for var in OKTETO_URL OKTETO_TOKEN OKTETO_SUBDOMAIN; do
+  if [ -z "$(eval echo \${$var:-})" ]; then
+    printf "${RED}  ERROR: Required environment variable %s is not set.${NC}\n" "$var"
+    exit 1
+  fi
+done
+
 # ── cleanup trap ──────────────────────────────────────────────────────────────
 
 TEST_NAMESPACE="${E2E_TEST_NAMESPACE:-okteto-e2e-$$}"
 PREVIEW_NAME="${E2E_PREVIEW_NAME:-e2e-preview-$$}"
+PERSONAL_NAMESPACE=""
 CLEANUP_DONE=0
 
 cleanup() {
@@ -113,9 +116,14 @@ cleanup() {
   CLEANUP_DONE=1
   printf "\n${YELLOW}  Running cleanup...${NC}\n"
 
-  okteto namespace use default 2>/dev/null || true
+  # Switch back to personal namespace if we know it
+  if [ -n "$PERSONAL_NAMESPACE" ]; then
+    OKTETO_NAMESPACE="$PERSONAL_NAMESPACE"
+    export OKTETO_NAMESPACE
+    okteto namespace use "$PERSONAL_NAMESPACE" 2>/dev/null || true
+  fi
 
-  if okteto namespace list 2>/dev/null | grep -q "^${TEST_NAMESPACE}"; then
+  if okteto namespace list 2>/dev/null | grep -q "${TEST_NAMESPACE}"; then
     okteto namespace delete "$TEST_NAMESPACE" 2>/dev/null || true
     printf "  Deleted test namespace: %s\n" "$TEST_NAMESPACE"
   fi
@@ -128,15 +136,6 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# ── validate required env vars ────────────────────────────────────────────────
-
-for var in OKTETO_URL OKTETO_TOKEN OKTETO_SUBDOMAIN; do
-  if [ -z "$(eval echo \${$var:-})" ]; then
-    printf "${RED}  ERROR: Required environment variable %s is not set.${NC}\n" "$var"
-    exit 1
-  fi
-done
-
 # ── header ────────────────────────────────────────────────────────────────────
 
 printf "\n${BOLD}%s${NC}\n" "════════════════════════════════════════════════"
@@ -148,24 +147,29 @@ printf "  Preview Name    :  %s\n" "${PREVIEW_NAME}"
 printf "${BOLD}%s${NC}\n\n" "════════════════════════════════════════════════"
 
 # ── 1. Authentication ─────────────────────────────────────────────────────────
-# We set OKTETO_CONTEXT, OKTETO_URL, and OKTETO_TOKEN as environment variables
-# so the CLI auto-initialises from them on every invocation without needing
-# a persisted context file. This is the recommended approach for CI/non-
-# interactive environments. The --insecure-skip-tls-verify flag is only
-# accepted by "context use" and is stored in the saved context for that call.
 section "1. Authentication"
 printf "  Authenticating with the Okteto platform using a service account token\n\n"
 
-# Run context use once to write the context file (including TLS skip setting)
+# context use is the only command that accepts --insecure-skip-tls-verify.
+# It persists the TLS setting in ~/.okteto/context/ for subsequent commands.
 time_step "Set Okteto context" \
   okteto context use "$OKTETO_URL" --token "$OKTETO_TOKEN" --insecure-skip-tls-verify
 
-# Export OKTETO_CONTEXT so all subsequent subshell invocations pick it up
-OKTETO_CONTEXT="$OKTETO_URL"
-export OKTETO_CONTEXT OKTETO_URL OKTETO_TOKEN
-
 time_step "Verify context is active" \
   okteto context show
+
+# Capture the personal namespace name (same as the token owner's username)
+# so we can switch back to it after tests and in the cleanup trap.
+PERSONAL_NAMESPACE=$(okteto context show -o json 2>/dev/null \
+  | jq -r '.namespace // empty' 2>/dev/null || true)
+printf "  Personal namespace: %s\n" "${PERSONAL_NAMESPACE:-unknown}"
+
+# Override OKTETO_NAMESPACE to point at the test namespace.
+# The Helm template injects OKTETO_NAMESPACE=okteto (the system namespace).
+# Unsetting it does not propagate into subshells spawned by time_step,
+# so we set it to the test namespace instead — this way every subshell
+# picks up the correct value automatically.
+export OKTETO_NAMESPACE="$TEST_NAMESPACE"
 
 section_summary
 
@@ -189,7 +193,7 @@ time_step "Switch to test namespace" \
   okteto namespace use "$TEST_NAMESPACE"
 
 time_step "Verify namespace appears in list" \
-  sh -c "okteto namespace list | grep -q '^${TEST_NAMESPACE}'"
+  sh -c "okteto namespace list | grep -q '${TEST_NAMESPACE}'"
 
 section_summary
 
@@ -199,7 +203,7 @@ printf "  Building oktetodo images via the Okteto Build Service (BuildKit)\n\n"
 
 cd "$DEMO_DIR"
 time_step "Build all images" \
-  okteto build --log-output plain
+  okteto build -n "$TEST_NAMESPACE" --log-output plain
 
 section_summary
 
@@ -208,9 +212,8 @@ section "5. Deployment"
 printf "  Deploying oktetodo into the test namespace\n\n"
 
 time_step "Deploy oktetodo" \
-  okteto deploy --wait
+  okteto deploy -n "$TEST_NAMESPACE" --wait
 
-# Retrieve the client ingress hostname for the reachability check
 CLIENT_HOST=$(kubectl get ingress \
   -n "$TEST_NAMESPACE" \
   -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || true)
@@ -253,7 +256,7 @@ section "7. Incremental Redeploy"
 printf "  Running a second deploy — should use Smart Build cache and skip rebuilds\n\n"
 
 time_step "Redeploy oktetodo (expect cache hit, no rebuild)" \
-  okteto deploy --wait
+  okteto deploy -n "$TEST_NAMESPACE" --wait
 
 time_step "Wait for all deployments to be ready after redeploy" \
   kubectl rollout status deployment \
@@ -267,7 +270,7 @@ section "8. Destroy Deployment"
 printf "  Running okteto destroy to remove all deployed resources\n\n"
 
 time_step "Destroy oktetodo" \
-  okteto destroy
+  okteto destroy -n "$TEST_NAMESPACE"
 
 time_step "Verify all deployments are removed from namespace" \
   sh -c "[ \"\$(kubectl get deployments -n '${TEST_NAMESPACE}' \
@@ -279,14 +282,22 @@ section_summary
 section "9. Destroy Namespace"
 printf "  Deleting the test namespace and confirming it is fully removed\n\n"
 
-time_step "Switch context away from test namespace" \
-  okteto namespace use default
+# Switch back to the personal namespace before deleting the test one.
+# Also reset OKTETO_NAMESPACE so subsequent commands don't try to operate
+# in the namespace we're about to delete.
+if [ -n "$PERSONAL_NAMESPACE" ]; then
+  export OKTETO_NAMESPACE="$PERSONAL_NAMESPACE"
+  time_step "Switch context back to personal namespace: $PERSONAL_NAMESPACE" \
+    okteto namespace use "$PERSONAL_NAMESPACE"
+else
+  skip "Personal namespace unknown — skipping context switch"
+fi
 
 time_step "Delete test namespace: $TEST_NAMESPACE" \
   okteto namespace delete "$TEST_NAMESPACE"
 
 time_step "Verify namespace is removed" \
-  sh -c "! okteto namespace list 2>/dev/null | grep -q '^${TEST_NAMESPACE}'"
+  sh -c "! okteto namespace list 2>/dev/null | grep -q '${TEST_NAMESPACE}'"
 
 CLEANUP_DONE=1
 
@@ -302,6 +313,7 @@ else
 
   time_step "Deploy preview environment: $PREVIEW_NAME" \
     okteto preview deploy "$PREVIEW_NAME" \
+      --repository "$DEMO_REPO" \
       --branch main \
       --scope global \
       --wait
